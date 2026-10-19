@@ -9,3 +9,4 @@ How to use:
 5. add it and start using it on 5 or 15m charts
 
 i also have a crt indicator thats a copy of c2c crt indicator in:
+https://github.com/kyr123151/crt-indicator/tree/main
