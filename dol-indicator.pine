@@ -1,0 +1,610 @@
+//@version=6
+// DOL Scored Target - single scored "Draw on Liquidity" target (original implementation)
+//
+// Built from the PUBLIC description and screenshot of the TradeAxis DOL indicator. The real script is
+// invite-only/closed-source, so its exact weights and formulas are unknown; this is an independent
+// re-implementation of the described mechanics and look. No third-party code is used.
+//
+// Mechanics
+//  1. A bounded POOL of liquidity levels is maintained on confirmed bars only:
+//     BSL/SSL swings, FVGs (+ inverted FVGs), Order Blocks (+ Breakers), 1H-volume LVNs, PDH/PDL/PWH/PWL
+//  2. Every level is scored 0-100 on four pillars:
+//     Proximity (ATR distance), Recency (exponential half-life), Confluence (PDH/PDL/PWH/PWL, day/week
+//     open, equilibrium, HTF bias alignment), Density (equal highs/lows / ranging bars before formation)
+//  3. The highest-scoring untouched level that passes the filters is the PRIMARY DOL target (zone)
+//  4. PoT% = heuristic touch probability, capped (default 95%): random-walk "reflection" estimate of
+//     touching the zone within N bars, blended with the score. It is a heuristic, not a guarantee.
+//  5. Multi-timeframe bias table (structure breaks confirmed by candle CLOSE beyond the swing)
+//  6. Ghost trail: when the target changes, a faded trace of the previous one stays on the chart
+//
+// Repaint safety
+//  - Pool changes (births, touches, inversions) happen only on confirmed bars (barstate.isconfirmed)
+//  - Pivots are confirmed after their right-hand bars; HTF levels use the last completed period
+//  - Bias default = last COMPLETED HTF bar ([1] + lookahead_on); "live" option is off by default
+//  - Only the on-chart drawing and the PoT number update tick-by-tick on the live bar
+//
+// Use a chart timeframe at or below your mode's lowest bias timeframe (5m or 15m for Day Trading).
+
+indicator("DOL Scored Target", shorttitle="DOL", overlay=true, max_bars_back=500, max_lines_count=300, max_labels_count=300, max_boxes_count=300)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+G1 = "Mode & bias"
+tradeMode = input.string("Day Trading", "Trading mode", options=["Swing", "Day Trading", "Scalping"], group=G1, tooltip="Swing: W / D / 4H bias.  Day Trading: D / 4H / 1H.  Scalping: 4H / 1H / 15m.")
+biasLen   = input.int(3, "Bias swing length", minval=2, maxval=10, group=G1)
+biasLive  = input.bool(false, "Bias uses live (unconfirmed) HTF bar", group=G1, tooltip="Off = last completed HTF bar only (no repaint). On = faster, but can change until the HTF bar closes.")
+
+G2 = "Scoring & filters"
+maxAtrDist = input.float(12.0, "Max ATR distance", minval=1.0, step=0.5, group=G2, tooltip="Levels farther than this (in ATR) are dropped from target selection.")
+minDistAtr = input.float(0.5, "Min target distance (ATR)", minval=0.0, step=0.1, group=G2)
+halfLife   = input.float(300.0, "Recency half-life (bars)", minval=20.0, group=G2)
+wProx      = input.float(35.0, "Weight: proximity", minval=0.0, group=G2)
+wRec       = input.float(20.0, "Weight: recency", minval=0.0, group=G2)
+wConf      = input.float(25.0, "Weight: confluence", minval=0.0, group=G2)
+wDen       = input.float(20.0, "Weight: density", minval=0.0, group=G2)
+confTol    = input.float(0.5, "Confluence tolerance (ATR)", minval=0.05, step=0.05, group=G2)
+maxPool    = input.int(40, "Max levels in pool", minval=10, maxval=100, group=G2)
+potBars    = input.int(60, "PoT horizon (bars)", minval=5, group=G2)
+potCap     = input.float(95.0, "PoT cap (%)", minval=50.0, maxval=100.0, group=G2)
+minPoT     = input.float(0.0, "Min PoT to show a target (%)", minval=0.0, maxval=95.0, group=G2)
+evalWin    = input.int(400, "Target analysis window (bars)", minval=50, maxval=2000, group=G2, tooltip="Target selection/ghosts are evaluated on the most recent N bars (keeps the script fast). The pool itself is built from all history.")
+
+G3 = "Modules"
+useBSLSSL  = input.bool(true, "Swing liquidity (BSL / SSL)", group=G3)
+swingLen   = input.int(8, "Swing length", minval=2, maxval=40, group=G3)
+useFVG     = input.bool(true, "Fair value gaps (+ iFVG inversions)", group=G3)
+fvgMin     = input.float(0.10, "Min FVG size (ATR)", minval=0.0, step=0.05, group=G3)
+maxIfvgIn  = input.int(3, "iFVG: max closes inside before removal", minval=1, maxval=20, group=G3)
+useOB      = input.bool(true, "Order blocks", group=G3)
+obBodyAtr  = input.float(1.2, "OB displacement body (ATR)", minval=0.5, step=0.1, group=G3)
+useBrk     = input.bool(true, "Breakers (failed OBs)", group=G3)
+useHtf     = input.bool(true, "Prev day / week high-low (PDH PDL PWH PWL)", group=G3)
+useLVN     = input.bool(true, "Volume-profile LVNs from 1H data (chart <= 1H)", group=G3)
+lvnHours   = input.int(72, "LVN lookback (1H bars)", minval=24, maxval=240, group=G3)
+lvnBins    = input.int(40, "LVN price bins", minval=20, maxval=100, group=G3)
+lvnThresh  = input.float(0.55, "LVN threshold (x average bin volume)", minval=0.1, maxval=1.0, step=0.05, group=G3)
+
+G4 = "Display"
+extBars    = input.int(10, "Target extension (bars to the right)", minval=2, maxval=60, group=G4)
+showZones  = input.bool(true, "Show top pool zones (FVG / OB / iFVG / Breaker)", group=G4)
+showLines  = input.bool(false, "Show top pool lines (BSL / SSL / PDH ...)", group=G4)
+showLVN    = input.bool(false, "Show LVN zones", group=G4)
+zoneTopN   = input.int(4, "How many pool levels to draw", minval=0, maxval=10, group=G4)
+showGhost  = input.bool(true, "Ghost trail", group=G4)
+ghostCount = input.int(3, "Ghost trails kept", minval=1, maxval=10, group=G4)
+showTable  = input.bool(true, "Show bias table", group=G4)
+colUp      = input.color(#00e676, "Draw up / bullish", group=G4)
+colDn      = input.color(#ff3d3d, "Draw down / bearish", group=G4)
+
+// ───────────────────────────── Types ─────────────────────────────
+type Pool
+    int    id
+    string kind     // BSL SSL PDH PDL PWH PWL FVG IFVG OB BRK LVN
+    float  top
+    float  bot
+    int    born
+    bool   bull     // current role: true = support (below), false = resistance (above)
+    bool   touched
+    float  dens
+    int    inside   // closes inside the box (iFVG cleanup)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+f_name(Pool p) =>
+    string out = p.kind
+    if p.kind == "FVG" or p.kind == "OB" or p.kind == "IFVG"
+        out := (p.bull ? "BU" : "BE") + p.kind
+    else if p.kind == "BRK"
+        out := (p.bull ? "BU" : "BE") + "BRK"
+    out
+
+f_dist(Pool p, float px) =>
+    math.max(0.0, math.max(p.bot - px, px - p.top))
+
+f_isLineKind(string k) =>
+    k == "BSL" or k == "SSL" or k == "PDH" or k == "PDL" or k == "PWH" or k == "PWL"
+
+f_show(Pool p) =>
+    p.kind == "LVN" ? showLVN : (f_isLineKind(p.kind) ? showLines : showZones)
+
+f_ncdf(float x) =>
+    float z = math.abs(x) / math.sqrt(2.0)
+    float t = 1.0 / (1.0 + 0.3275911 * z)
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+    float erfv = 1.0 - poly * math.exp(-z * z)
+    x >= 0 ? 0.5 * (1.0 + erfv) : 0.5 * (1.0 - erfv)
+
+f_score(Pool p, float px, float atrV, array<float> refs, float bsV, int curBar) =>
+    float d = f_dist(p, px)
+    float maxD = maxAtrDist * atrV
+    float prox = d >= maxD ? 0.0 : 1.0 - d / maxD
+    float rec = math.pow(0.5, (curBar - p.born) / halfLife)
+    float tol = confTol * atrV
+    int hits = 0
+    for r in refs
+        if not na(r) and r >= p.bot - tol and r <= p.top + tol
+            hits += 1
+    float confRef = math.min(1.0, hits / 2.0)
+    float align = p.bot > px ? math.max(0.0, bsV) : (p.top < px ? math.max(0.0, -bsV) : 0.0)
+    float conf = 0.5 * confRef + 0.5 * align
+    float wsum = math.max(wProx + wRec + wConf + wDen, 0.0001)
+    100.0 * (wProx * prox + wRec * rec + wConf * conf + wDen * p.dens) / wsum
+
+// Touch probability (%), heuristic: driftless random-walk reflection estimate blended with the score
+f_pot(Pool p, float score, float px, float sig) =>
+    float d = f_dist(p, px)
+    float sd = math.max(sig, syminfo.mintick) * math.sqrt(potBars)
+    float prw = d <= 0 ? 1.0 : 2.0 * (1.0 - f_ncdf(d / sd))
+    float raw = 0.6 * prw + 0.4 * score / 100.0
+    math.min(potCap / 100.0, raw) * 100.0
+
+f_dens(float lo, float hi, float tol, int startOff, int n) =>
+    int cnt = 0
+    for i = startOff to startOff + n - 1
+        if high[i] >= lo - tol and low[i] <= hi + tol
+            cnt += 1
+    math.min(1.0, cnt / (n * 0.3))
+
+f_findOpp(bool wantBearCandle, int maxBack) =>
+    int idx = -1
+    for i = 1 to maxBack
+        bool ok = wantBearCandle ? close[i] < open[i] : close[i] > open[i]
+        if ok and idx == -1
+            idx := i
+    idx
+
+f_birth(array<Pool> arr, int id, string kind, float top, float bot, int born, bool bull, float dens) =>
+    arr.push(Pool.new(id, kind, top, bot, born, bull, false, dens, 0))
+
+f_removeKind(array<Pool> arr, string kind) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Pool q = arr.get(i)
+            if q.kind == kind
+                arr.remove(i)
+
+f_bestIdx(array<Pool> arr, float px, float atrV, array<float> refs, float bsV, int curBar, float sig) =>
+    int bi = -1
+    float bsc = -1.0
+    if arr.size() > 0
+        for i = 0 to arr.size() - 1
+            Pool p = arr.get(i)
+            if not p.touched
+                float d = f_dist(p, px)
+                if d < maxAtrDist * atrV and d >= minDistAtr * atrV
+                    float s = f_score(p, px, atrV, refs, bsV, curBar)
+                    float pt = f_pot(p, s, px, sig)
+                    if pt >= minPoT and s > bsc
+                        bi := i
+                        bsc := s
+    bi
+
+// Structure bias: swing breaks confirmed by a candle CLOSE beyond the swing (1 bull, -1 bear, 0 neutral)
+f_struct(int len) =>
+    float ph0 = ta.pivothigh(high, len, len)
+    float pl0 = ta.pivotlow(low, len, len)
+    var float lastH = na
+    var float lastL = na
+    var int trend = 0
+    if not na(ph0)
+        lastH := ph0
+    if not na(pl0)
+        lastL := pl0
+    if not na(lastH) and close > lastH
+        trend := 1
+        lastH := na
+    if not na(lastL) and close < lastL
+        trend := -1
+        lastL := na
+    trend
+
+f_tfLabel(string tf) =>
+    string out = tf
+    if tf != "D" and tf != "W" and tf != "M"
+        int m = int(str.tonumber(tf))
+        out := m >= 60 and m % 60 == 0 ? str.tostring(int(m / 60)) + "H" : str.tostring(m) + "m"
+    out
+
+f_biasTxt(int t) =>
+    t == 1 ? "BULLISH" : t == -1 ? "BEARISH" : "NEUTRAL"
+
+f_biasCol(int t) =>
+    t == 1 ? #00c853 : t == -1 ? #ff5252 : #9598a1
+
+f_ghost(array<line> gl, array<label> gb, int since, float edge, bool up, string nm, bool hit) =>
+    color c = up ? colUp : colDn
+    int x1 = math.min(since, bar_index - 1)
+    line l = line.new(x1, edge, bar_index, edge, color=color.new(c, 70), style=line.style_dotted, width=1)
+    label b = label.new(bar_index, edge, nm + (hit ? " ✓" : " ✕"), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.new(c, 40), size=size.tiny)
+    gl.push(l)
+    gb.push(b)
+    if gl.size() > ghostCount
+        line.delete(gl.shift())
+        label.delete(gb.shift())
+
+f_rebuildLVN(array<Pool> arr, array<float> hH, array<float> hL, array<float> hV, float atrV) =>
+    f_removeKind(arr, "LVN")
+    float pmin = hL.min()
+    float pmax = hH.max()
+    if pmax > pmin
+        int nb = lvnBins
+        float step = (pmax - pmin) / nb
+        array<float> bins = array.new<float>(nb, 0.0)
+        for k = 0 to hH.size() - 1
+            float lo = hL.get(k)
+            float hi = hH.get(k)
+            float v = nz(hV.get(k))
+            int i0 = math.max(0, math.min(nb - 1, int(math.floor((lo - pmin) / step))))
+            int i1 = math.max(0, math.min(nb - 1, int(math.floor((hi - pmin) / step))))
+            float share = v / (i1 - i0 + 1)
+            for j = i0 to i1
+                bins.set(j, bins.get(j) + share)
+        float avg = bins.sum() / nb
+        if avg > 0
+            int added = 0
+            for i = 2 to nb - 3
+                float vi = bins.get(i)
+                bool isMin = vi < lvnThresh * avg and vi < bins.get(i - 1) and vi <= bins.get(i + 1) and vi <= bins.get(i - 2) and vi <= bins.get(i + 2)
+                if isMin and added < 6
+                    float zb = pmin + i * step
+                    float zt = zb + step
+                    float mid = (zb + zt) / 2
+                    if math.abs(mid - close) < maxAtrDist * atrV
+                        added += 1
+                        f_birth(arr, 1000000 + bar_index * 10 + added, "LVN", zt, zb, bar_index, mid < close, 0.0)
+
+// ───────────────────────────── Series data ─────────────────────────────
+atr   = ta.atr(14)
+sigma = ta.stdev(ta.change(close), 100)
+hh10  = ta.highest(high, 10)
+ll10  = ta.lowest(low, 10)
+ph    = ta.pivothigh(high, swingLen, swingLen)
+pl    = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+float eqV = na(lastPH) or na(lastPL) ? na : (lastPH + lastPL) / 2
+
+bool bullGap = low > high[2] and (low - high[2]) >= fvgMin * atr
+bool bearGap = high < low[2] and (low[2] - high) >= fvgMin * atr
+bool bullDisp = close > open and (close - open) >= obBodyAtr * atr and close > hh10[1]
+bool bearDisp = close < open and (open - close) >= obBodyAtr * atr and close < ll10[1]
+int obIdxBull = f_findOpp(true, 6)
+int obIdxBear = f_findOpp(false, 6)
+
+// Bias timeframes by mode
+string tf1 = tradeMode == "Swing" ? "W" : tradeMode == "Day Trading" ? "D" : "240"
+string tf2 = tradeMode == "Swing" ? "D" : tradeMode == "Day Trading" ? "240" : "60"
+string tf3 = tradeMode == "Swing" ? "240" : tradeMode == "Day Trading" ? "60" : "15"
+
+int b1c = request.security(syminfo.tickerid, tf1, f_struct(biasLen)[1], lookahead=barmerge.lookahead_on)
+int b2c = request.security(syminfo.tickerid, tf2, f_struct(biasLen)[1], lookahead=barmerge.lookahead_on)
+int b3c = request.security(syminfo.tickerid, tf3, f_struct(biasLen)[1], lookahead=barmerge.lookahead_on)
+int b1l = request.security(syminfo.tickerid, tf1, f_struct(biasLen))
+int b2l = request.security(syminfo.tickerid, tf2, f_struct(biasLen))
+int b3l = request.security(syminfo.tickerid, tf3, f_struct(biasLen))
+int b1 = biasLive ? b1l : b1c
+int b2 = biasLive ? b2l : b2c
+int b3 = biasLive ? b3l : b3c
+float bs = nz(b1) * 0.5 + nz(b2) * 0.3 + nz(b3) * 0.2
+
+// Previous completed day/week + opens (no future data)
+float pdhV = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float pdlV = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+float pwhV = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+float pwlV = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_on)
+float dOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+float wOpen = request.security(syminfo.tickerid, "W", open, lookahead=barmerge.lookahead_on)
+
+int tfSec = timeframe.in_seconds()
+bool dOk = useHtf and tfSec < 86400
+bool wOk = useHtf and tfSec < 604800
+bool pdhCh = not na(pdhV) and (na(pdhV[1]) or pdhV != pdhV[1])
+bool pdlCh = not na(pdlV) and (na(pdlV[1]) or pdlV != pdlV[1])
+bool pwhCh = not na(pwhV) and (na(pwhV[1]) or pwhV != pwhV[1])
+bool pwlCh = not na(pwlV) and (na(pwlV[1]) or pwlV != pwlV[1])
+
+// Previous completed 1H bar (for the volume profile)
+[t1h, h1h, l1h, v1h] = request.security(syminfo.tickerid, "60", [time, high[1], low[1], volume[1]], lookahead=barmerge.lookahead_on)
+float dT1h = ta.change(t1h)
+bool newHour = tfSec <= 3600 and dT1h != 0
+
+array<float> refs = array.from(pdhV, pdlV, pwhV, pwlV, dOpen, wOpen, eqV)
+
+// ───────────────────────────── State ─────────────────────────────
+var array<Pool>  pool    = array.new<Pool>()
+var array<float> hqH     = array.new<float>()
+var array<float> hqL     = array.new<float>()
+var array<float> hqV     = array.new<float>()
+var array<line>  ghostLn = array.new<line>()
+var array<label> ghostLb = array.new<label>()
+var array<box>   zoneBx  = array.new<box>()
+var array<line>  zoneLn  = array.new<line>()
+var array<label> zoneLb  = array.new<label>()
+var int    idSeq    = 0
+var int    lastOb   = -100
+var int    primId   = -1
+var int    primSince = 0
+var float  primEdge = na
+var bool   primUp   = true
+var string primName = ""
+
+bool newTargetAlert = false
+bool primHitAlert   = false
+bool newIfvgAlert   = false
+bool primHitNow     = false
+bool evalBar = barstate.islast or (last_bar_index - bar_index <= evalWin)
+
+// ───────────────────────────── Pool maintenance (confirmed bars only) ─────────────────────────────
+if barstate.isconfirmed
+    // 1) touches, sweeps, inversions, mitigations
+    if pool.size() > 0
+        for i = pool.size() - 1 to 0
+            Pool p = pool.get(i)
+            bool rem = false
+            bool hitNow = false
+            if p.kind == "BSL" or p.kind == "PDH" or p.kind == "PWH"
+                if high > p.top
+                    rem := true
+                    hitNow := true
+            else if p.kind == "SSL" or p.kind == "PDL" or p.kind == "PWL"
+                if low < p.bot
+                    rem := true
+                    hitNow := true
+            else if p.kind == "FVG"
+                if p.bull
+                    if not p.touched and low <= p.top
+                        p.touched := true
+                        hitNow := true
+                    if close < p.bot
+                        p.kind := "IFVG"
+                        p.bull := false
+                        p.touched := false
+                        p.inside := 0
+                        newIfvgAlert := true
+                else
+                    if not p.touched and high >= p.bot
+                        p.touched := true
+                        hitNow := true
+                    if close > p.top
+                        p.kind := "IFVG"
+                        p.bull := true
+                        p.touched := false
+                        p.inside := 0
+                        newIfvgAlert := true
+            else if p.kind == "IFVG"
+                if close > p.bot and close < p.top
+                    p.inside := p.inside + 1
+                if p.inside > maxIfvgIn
+                    rem := true
+                if p.bull
+                    if not p.touched and low <= p.top
+                        p.touched := true
+                        hitNow := true
+                else
+                    if not p.touched and high >= p.bot
+                        p.touched := true
+                        hitNow := true
+            else if p.kind == "OB"
+                if p.bull
+                    if not p.touched and low <= p.top
+                        p.touched := true
+                        hitNow := true
+                    if close < p.bot
+                        if useBrk
+                            p.kind := "BRK"
+                            p.bull := false
+                            p.touched := false
+                        else
+                            rem := true
+                else
+                    if not p.touched and high >= p.bot
+                        p.touched := true
+                        hitNow := true
+                    if close > p.top
+                        if useBrk
+                            p.kind := "BRK"
+                            p.bull := true
+                            p.touched := false
+                        else
+                            rem := true
+            else if p.kind == "BRK"
+                if p.bull
+                    if not p.touched and low <= p.top
+                        p.touched := true
+                        hitNow := true
+                    if close < p.bot
+                        rem := true
+                else
+                    if not p.touched and high >= p.bot
+                        p.touched := true
+                        hitNow := true
+                    if close > p.top
+                        rem := true
+            else if p.kind == "LVN"
+                if not p.touched and low <= p.top and high >= p.bot
+                    p.touched := true
+                    hitNow := true
+            if hitNow and p.id == primId
+                primHitNow := true
+            if rem
+                pool.remove(i)
+
+    // 2) births (after updates, so a new level is never touched on its own bar)
+    if useBSLSSL and not na(ph)
+        idSeq += 1
+        f_birth(pool, idSeq, "BSL", ph, ph, bar_index - swingLen, false, f_dens(ph, ph, 0.15 * atr, swingLen, 40))
+    if useBSLSSL and not na(pl)
+        idSeq += 1
+        f_birth(pool, idSeq, "SSL", pl, pl, bar_index - swingLen, true, f_dens(pl, pl, 0.15 * atr, swingLen, 40))
+    if useFVG and bullGap
+        idSeq += 1
+        f_birth(pool, idSeq, "FVG", low, high[2], bar_index - 1, true, f_dens(high[2], low, 0.0, 3, 24))
+    if useFVG and bearGap
+        idSeq += 1
+        f_birth(pool, idSeq, "FVG", low[2], high, bar_index - 1, false, f_dens(high, low[2], 0.0, 3, 24))
+    if useOB and bullDisp and obIdxBull > 0 and bar_index - lastOb > 4
+        idSeq += 1
+        f_birth(pool, idSeq, "OB", high[obIdxBull], low[obIdxBull], bar_index - obIdxBull, true, f_dens(low[obIdxBull], high[obIdxBull], 0.0, obIdxBull + 1, 24))
+        lastOb := bar_index
+    if useOB and bearDisp and obIdxBear > 0 and bar_index - lastOb > 4
+        idSeq += 1
+        f_birth(pool, idSeq, "OB", high[obIdxBear], low[obIdxBear], bar_index - obIdxBear, false, f_dens(low[obIdxBear], high[obIdxBear], 0.0, obIdxBear + 1, 24))
+        lastOb := bar_index
+    if dOk and pdhCh
+        f_removeKind(pool, "PDH")
+        idSeq += 1
+        f_birth(pool, idSeq, "PDH", pdhV, pdhV, bar_index, false, 0.6)
+    if dOk and pdlCh
+        f_removeKind(pool, "PDL")
+        idSeq += 1
+        f_birth(pool, idSeq, "PDL", pdlV, pdlV, bar_index, true, 0.6)
+    if wOk and pwhCh
+        f_removeKind(pool, "PWH")
+        idSeq += 1
+        f_birth(pool, idSeq, "PWH", pwhV, pwhV, bar_index, false, 0.6)
+    if wOk and pwlCh
+        f_removeKind(pool, "PWL")
+        idSeq += 1
+        f_birth(pool, idSeq, "PWL", pwlV, pwlV, bar_index, true, 0.6)
+
+    // 3) 1H volume profile -> LVNs (rebuilt once per completed hour)
+    if useLVN and newHour and not na(h1h) and not na(l1h)
+        hqH.push(h1h)
+        hqL.push(l1h)
+        hqV.push(nz(v1h))
+        if hqH.size() > lvnHours
+            hqH.shift()
+            hqL.shift()
+            hqV.shift()
+        if hqH.size() >= 24
+            f_rebuildLVN(pool, hqH, hqL, hqV, atr)
+
+    // 4) keep the pool bounded: drop the lowest-scoring level
+    while pool.size() > maxPool
+        int wi = 0
+        float ws = 1.0e9
+        for i = 0 to pool.size() - 1
+            float s0 = f_score(pool.get(i), close, atr, refs, bs, bar_index)
+            if s0 < ws
+                ws := s0
+                wi := i
+        pool.remove(wi)
+
+// ───────────────────────────── Primary target ─────────────────────────────
+int bestIdx = evalBar ? f_bestIdx(pool, close, atr, refs, bs, bar_index, sigma) : -1
+int bestId = -1
+float bestScore = na
+float bestPot = na
+if bestIdx >= 0
+    Pool bp = pool.get(bestIdx)
+    bestId := bp.id
+    bestScore := f_score(bp, close, atr, refs, bs, bar_index)
+    bestPot := f_pot(bp, bestScore, close, sigma)
+
+if barstate.isconfirmed and evalBar
+    if bestId != primId
+        if primId != -1 and showGhost
+            f_ghost(ghostLn, ghostLb, primSince, primEdge, primUp, primName, primHitNow)
+        if bestId != -1
+            newTargetAlert := true
+            Pool np = pool.get(bestIdx)
+            primUp := np.bot > close
+            primEdge := np.bot > close ? np.bot : (np.top < close ? np.top : (np.top + np.bot) / 2)
+            primName := f_name(np)
+        primId := bestId
+        primSince := bar_index
+    if primHitNow
+        primHitAlert := true
+
+// ───────────────────────────── Drawing (last bar only) ─────────────────────────────
+var box   tBox  = na
+var line  tGlow = na
+var line  tCore = na
+var line  tDash = na
+var label tLbl  = na
+var table tbl   = table.new(position.top_right, 2, 4, bgcolor=#000000, border_width=1, border_color=color.new(#787b86, 55), frame_width=1, frame_color=color.new(#787b86, 45))
+
+if barstate.islast
+    // clear previous frame
+    if not na(tBox)
+        box.delete(tBox)
+    if not na(tGlow)
+        line.delete(tGlow)
+    if not na(tCore)
+        line.delete(tCore)
+    if not na(tDash)
+        line.delete(tDash)
+    if not na(tLbl)
+        label.delete(tLbl)
+    for b in zoneBx
+        box.delete(b)
+    zoneBx.clear()
+    for l in zoneLn
+        line.delete(l)
+    zoneLn.clear()
+    for lb in zoneLb
+        label.delete(lb)
+    zoneLb.clear()
+
+    int right = bar_index + extBars
+
+    // primary target: zone, glowing edge, dashed path from price, label with PoT
+    if bestIdx >= 0
+        Pool tp = pool.get(bestIdx)
+        bool up = tp.bot > close
+        color col = up ? colUp : colDn
+        float zt = math.max(tp.top, tp.bot + 0.06 * atr)
+        float zb = tp.bot
+        float edge = up ? zb : zt
+        int left = math.min(math.max(tp.born, bar_index - 1500), bar_index - 2)
+        tBox := box.new(left, zt, right, zb, border_color=color.new(col, 40), border_style=line.style_dashed, border_width=1, bgcolor=color.new(col, 82))
+        tGlow := line.new(left, edge, right, edge, color=color.new(col, 70), width=5)
+        tCore := line.new(left, edge, right, edge, color=col, width=2)
+        tDash := line.new(bar_index, close, right, edge, color=color.new(col, 15), style=line.style_dashed, width=1)
+        tLbl := label.new(right, (zt + zb) / 2, "Target: " + f_name(tp) + "\nPoT: " + str.tostring(bestPot, "0.0") + "%", style=label.style_label_left, color=color.new(up ? #0b3d1f : #3d0b0b, 8), textcolor=col, size=size.small, textalign=text.align_left)
+
+    // top pool levels (excluding the primary), by score
+    if zoneTopN > 0 and pool.size() > 0 and (showZones or showLines or showLVN)
+        array<bool> used = array.new<bool>(pool.size(), false)
+        for n = 1 to zoneTopN
+            int pick = -1
+            float pickS = -1.0
+            for i = 0 to pool.size() - 1
+                Pool q = pool.get(i)
+                if not used.get(i) and q.id != bestId and not q.touched and f_show(q)
+                    if f_dist(q, close) < maxAtrDist * atr
+                        float s = f_score(q, close, atr, refs, bs, bar_index)
+                        if s > pickS
+                            pick := i
+                            pickS := s
+            if pick >= 0
+                used.set(pick, true)
+                Pool z = pool.get(pick)
+                color zc = z.bull ? colUp : colDn
+                int zl = math.min(math.max(z.born, bar_index - 1500), bar_index - 2)
+                if f_isLineKind(z.kind)
+                    zoneLn.push(line.new(zl, z.top, right, z.top, color=color.new(zc, 35), style=line.style_dotted))
+                    zoneLb.push(label.new(right, z.top, f_name(z), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.new(zc, 25), size=size.tiny))
+                else
+                    float zt2 = math.max(z.top, z.bot + 0.04 * atr)
+                    zoneBx.push(box.new(zl, zt2, right, z.bot, border_color=color.new(zc, 70), bgcolor=color.new(zc, 88)))
+                    zoneLb.push(label.new(right, (zt2 + z.bot) / 2, f_name(z), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.new(zc, 30), size=size.tiny))
+
+    // bias table
+    if showTable
+        table.cell(tbl, 0, 0, "Timeframe", text_color=#d1d4dc, text_size=size.small, bgcolor=#1e222d)
+        table.cell(tbl, 1, 0, "Bias", text_color=#d1d4dc, text_size=size.small, bgcolor=#1e222d)
+        table.cell(tbl, 0, 1, f_tfLabel(tf1), text_color=#ffffff, text_size=size.small)
+        table.cell(tbl, 1, 1, f_biasTxt(b1), text_color=f_biasCol(b1), text_size=size.small)
+        table.cell(tbl, 0, 2, f_tfLabel(tf2), text_color=#ffffff, text_size=size.small)
+        table.cell(tbl, 1, 2, f_biasTxt(b2), text_color=f_biasCol(b2), text_size=size.small)
+        table.cell(tbl, 0, 3, f_tfLabel(tf3), text_color=#ffffff, text_size=size.small)
+        table.cell(tbl, 1, 3, f_biasTxt(b3), text_color=f_biasCol(b3), text_size=size.small)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+alertcondition(newTargetAlert, "New DOL target active", "DOL: priority moved to a new highest-scoring level")
+alertcondition(newIfvgAlert, "New iFVG formed", "DOL: a fair value gap was inverted into an iFVG")
+alertcondition(primHitAlert, "DOL target hit", "DOL: price touched the active target")
